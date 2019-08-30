@@ -10,6 +10,7 @@
 #include <string>
 #include <vector>
 #include <unordered_map>
+#include <mutex>
 
 #include "nanomsg/src/nn.h"
 #include "nanomsg/src/reqrep.h"
@@ -39,8 +40,8 @@ const int kMsgCompressNone = 0;
 const int kMsgCompressSnappy = 2;
 const int kMsgCompressGzip = 3;
 
-bool msgSocketSend(int fd, const std::string &msg);
-int msgSocketRecv(int fd, std::string &s);
+int msgSocketSend(int fd, const std::string &msg);
+int msgSocketRecv(int fd, std::string &msg);
 
 std::string msgRepEncode(RepMeta *meta_entry, const pb::Message *msg_entry);
 
@@ -220,16 +221,20 @@ extern Server *NewServer(std::string ip, int port);
 
 class Channel : public pb::RpcChannel {
    private:
-    std::string addr_;
     int sock_;
     int epid_;
+    int tto_;
     int reconnect();
 
    public:
+    std::string id_;
+    std::string addr_;
+    bool active;
     Channel(std::string addr, int sock, int epid) {
         addr_ = addr;
         sock_ = sock;
         epid_ = epid;
+        active = false;
     };
     virtual ~Channel() {
         Close();
@@ -238,6 +243,7 @@ class Channel : public pb::RpcChannel {
                             pb::RpcController *controller,
                             const pb::Message *req, pb::Message *rep,
                             pb::Closure *done);
+    void Timeout(int ms);
     void Close() {
         if (sock_ >= 0) {
             if (epid_ >= 0) {
@@ -250,9 +256,21 @@ class Channel : public pb::RpcChannel {
     };
 };
 
-extern Channel *NewChannel(std::string addr);
+Channel *NewChannel(std::string addr);
 
-extern Channel *ChannelPoll(std::string addr);
+typedef std::unordered_map<std::string, Channel *> ChannelList;
+
+class ChannelPool {
+   private:
+    static std::mutex mu_;
+    static ChannelList channels_;
+
+   public:
+    ChannelPool() {};
+    ~ChannelPool() {};
+    static Channel *Pull(const std::string &addr);
+    static void Push(Channel *chan);
+};
 
 } // namespace hrpc
 

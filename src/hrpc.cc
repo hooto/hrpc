@@ -10,6 +10,7 @@
 #include <exception>
 #include <stdexcept>
 #include <sys/time.h>
+#include <mutex>
 
 #include "fmt/format.h"
 #include "snappy/snappy.h"
@@ -21,14 +22,14 @@
 
 namespace hrpc {
 
-bool msgSocketSend(int fd, const std::string &msg) {
+int msgSocketSend(int fd, const std::string &msg) {
 
     int n = ::nn_send(fd, msg.c_str(), msg.size(), 0);
     if (n < 0) {
-        return false;
+        return -1;
     }
 
-    return true;
+    return n;
 }
 
 int msgSocketRecv(int fd, std::string &s) {
@@ -336,6 +337,7 @@ void *Server::Start(void *ptr) {
     // int stats_num = 0;
 
     for (;;) {
+
         // stats_num += 1;
         // if (stats_num % 1000 == 0) {
         //     std::cout << __FILE__ << ", " << __LINE__ << ", " << stats_num
@@ -434,6 +436,7 @@ void Channel::CallMethod(const pb::MethodDescriptor *method,
                          pb::RpcController *ctr, const pb::Message *req,
                          pb::Message *rep, pb::Closure *done) {
 
+    int64_t tn = util::timenow_us();
     std::string srv_name = std::string(method->full_name());
 
     int i1 = srv_name.find_first_of(".");
@@ -454,7 +457,7 @@ void Channel::CallMethod(const pb::MethodDescriptor *method,
         // std::cout << " Channel Send " << msg.size() << "\n";
         for (int i = 0; i < 2; i++) {
 
-            if (msgSocketSend(sock_, msg)) {
+            if (msgSocketSend(sock_, msg) >= 0) {
 
                 std::string rep_msg;
                 int n = msgSocketRecv(sock_, rep_msg);
@@ -481,7 +484,24 @@ void Channel::CallMethod(const pb::MethodDescriptor *method,
             }
         }
     }
+
+    ChannelPool::Push(this);
 };
+
+void Channel::Timeout(int ms) {
+
+    if (ms < 1000) {
+        ms = 1000;
+    } else if (ms > kMsgTimeOut) {
+        ms = kMsgTimeOut;
+    }
+    tto_ = ms;
+
+    if (sock_ >= 0) {
+        ::nn_setsockopt(sock_, NN_SOL_SOCKET, NN_SNDTIMEO, &tto_, sizeof(tto_));
+        ::nn_setsockopt(sock_, NN_SOL_SOCKET, NN_RCVTIMEO, &tto_, sizeof(tto_));
+    }
+}
 
 int Channel::reconnect() {
 
@@ -516,39 +536,68 @@ Channel *NewChannel(std::string addr) {
     int _mms = kMsgMaxSize;
     ::nn_setsockopt(sock, NN_SOL_SOCKET, NN_RCVMAXSIZE, &_mms, sizeof(_mms));
 
-    int _mto = kMsgTimeOut;
-    ::nn_setsockopt(sock, NN_SOL_SOCKET, NN_SNDTIMEO, &_mto, sizeof(_mto));
-    ::nn_setsockopt(sock, NN_SOL_SOCKET, NN_RCVTIMEO, &_mto, sizeof(_mto));
-
     int _mbs = kMsgBufSize;
     ::nn_setsockopt(sock, NN_SOL_SOCKET, NN_SNDBUF, &_mbs, sizeof(_mbs));
     ::nn_setsockopt(sock, NN_SOL_SOCKET, NN_RCVBUF, &_mbs, sizeof(_mbs));
 
     Channel *c = new Channel(addr, sock, epid);
 
+    c->Timeout(kMsgTimeOut);
+
     return c;
 };
 
-typedef std::unordered_map<std::string, Channel *> ChannelList;
+std::mutex ChannelPool::mu_;
+ChannelList ChannelPool::channels_;
 
-static ChannelList channelCaches;
+Channel *ChannelPool::Pull(const std::string &addr) {
 
-Channel *ChannelPoll(std::string addr) {
+    Channel *ch = NULL;
 
-    if (channelCaches.size() > 0) {
-        ChannelList::iterator it = channelCaches.find(addr);
-        if (it != channelCaches.end()) {
-            return it->second;
+    for (int retry = 0; retry < 10; retry++) {
+
+        mu_.lock();
+
+        for (int i = 0; i < 4; i++) {
+            std::string k = fmt::sprintf("%s:%d", addr.c_str(), i);
+            auto v = channels_.find(k);
+            if (v != channels_.end()) {
+                if (!v->second->active) {
+                    ch = v->second;
+                    break;
+                }
+            } else {
+                ch = NewChannel(addr);
+                if (ch != NULL) {
+                    ch->id_ = k;
+                    channels_[k] = ch;
+                }
+                break;
+            }
         }
-    }
 
-    Channel *ch = NewChannel(addr);
-    if (ch != NULL) {
-        channelCaches[addr] = ch;
+        if (ch != NULL) {
+            ch->active = true;
+        }
+
+        mu_.unlock();
+
+        if (ch != NULL) {
+            break;
+        }
+
+        usleep(10000);
     }
 
     return ch;
 };
+
+void ChannelPool::Push(Channel *ch) {
+    mu_.lock();
+    // std::cout << "RPC PUSH " << ch->id_ << "\n";
+    ch->active = false;
+    mu_.unlock();
+}
 
 std::string AuthMac::Sign(const std::string &data) {
     std::string buf;
